@@ -46,6 +46,8 @@ from sklearn.tree import DecisionTreeRegressor, ExtraTreeRegressor
 from sklearn.tree._tree import DTYPE
 from sklearn.utils import parse_version
 
+from numba import jit
+
 param_validation = True
 try:
     from sklearn.utils._param_validation import Interval, RealNotInt
@@ -57,6 +59,18 @@ from ._quantile_forest_fast import QuantileForest, generate_unsampled_indices
 
 sklearn_version = parse_version(sklearn.__version__)
 
+@jit(nopython=True)
+def _count_digits_numba(digits, n_bins):
+    n_tsteps = len(digits)
+    n_samples_per_leaf = digits.shape[1]
+    toadd = np.zeros((n_tsteps, n_bins), dtype=np.int64)
+    for i in range(n_tsteps):  # Iterate over time steps
+        for j in range(n_samples_per_leaf):
+            digit = digits[i, j]
+            for k in range(n_bins):  # Iterate over the second dimension of 'digits'
+                if digit == k:  # Check if the digit is within the valid range of bins
+                    toadd[i, k] += 1  # Increment the count for the bin
+    return toadd
 
 def _generate_unsampled_indices(sample_indices, duplicates=None):
     """Private function used by forest._get_y_train_leaves function."""
@@ -815,8 +829,9 @@ class BaseForestQuantileRegressor(ForestRegressor):
             n_bins = len(bins)
 
             # don't use more than 4 GB of memory
-            n_blocks_samples = int(np.ceil(n_leaf_sample * n_tsteps * 8 / 4E9))
-            idx_samples = np.array_split(np.arange(n_leaf_sample), n_blocks_samples)
+            n_blocks_samples_per_leaf = int(np.ceil(n_leaf_sample * n_tsteps * 8 / 4E9))
+            idx_samples_per_leaf = np.array_split(np.arange(n_leaf_sample), 
+                n_blocks_samples_per_leaf)
             if len(quantiles) > 1:
                  y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
             elif quantiles[0] == -1:
@@ -824,9 +839,9 @@ class BaseForestQuantileRegressor(ForestRegressor):
             for output in range(y_train.shape[1]):
                 leaf_hist = np.zeros((n_tsteps, n_bins))
                 for tree in range(self.n_estimators):
-                    for block in range(n_blocks_samples): # loop on samples by leaf
+                    for block in range(n_blocks_samples_per_leaf): # loop on samples by leaf
                         if X_indices is None:  # IB scoring
-                            train_indices = y_train_leaves[:,:,:,idx_samples[block]][tree, X_leaves[:, tree], output]
+                            train_indices = y_train_leaves[:,:,:,idx_samples_per_leaf[block]][tree, X_leaves[:, tree], output]
                         else:  # OOB scoring
                             warn('This is not implemented!! ')
                             # indices = X_indices[:, tree] == 1
@@ -836,20 +851,18 @@ class BaseForestQuantileRegressor(ForestRegressor):
                         y_extract = y_train[train_indices - 1, output]
                         digits = np.digitize(y_extract,bins, right = True) # index of y_extract in bins
                         digits[train_indices == 0] = -1 # so they are not used in loop below
-                        toadd = np.zeros((n_tsteps, n_bins))
-                        for i in range(n_bins): # loop on bins: this is the BOTTLENECK
-                            toadd[range(n_tsteps), i] = np.count_nonzero(digits == i, axis = 1)
+                        toadd = _count_digits_numba(digits, n_bins)
                         leaf_hist += toadd
 
 
                 if len(quantiles) == 1 and quantiles[0] == -2:
-                    n_train_samples = np.sum(leaf_hist, axis = 1)
+                    total_samples = np.sum(leaf_hist, axis = 1)
                     y_pred = np.empty((n_tsteps, y_train.shape[1], 2, n_bins))
 
                     # Calculate the cumulative sum of the histogram counts
                     events = np.cumsum(leaf_hist, axis = 1)
                     # Normalize to get the cumulative probability (ECDF values)
-                    cdf = events / n_train_samples[:,None]
+                    cdf = events / total_samples[:,None]
 
                     bins_tiled = np.tile(bins,(n_tsteps, 1))
                     y_pred[:, output, 0, :] = bins_tiled
