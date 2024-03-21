@@ -22,6 +22,7 @@ Single and multi-output problems are both handled.
 """
 
 import random
+import psutil
 import warnings
 from abc import abstractmethod
 from math import ceil
@@ -29,6 +30,8 @@ from numbers import Integral, Real
 from warnings import warn
 
 from scipy import stats
+from scipy.sparse import csr_matrix
+from scipy.stats._survival import ECDFResult
 
 import sys
 import joblib
@@ -615,6 +618,7 @@ class BaseForestQuantileRegressor(ForestRegressor):
         weighted_quantile=True,
         weighted_leaves=False,
         aggregate_leaves_first=True,
+        reduce_to_occurences=True,
         oob_score=False,
         indices=None,
         duplicates=None,
@@ -685,6 +689,7 @@ class BaseForestQuantileRegressor(ForestRegressor):
             all quantiles, return ``y`` at ``q`` for which ``F(Y=y|x) = q``,
             where ``q`` is the quantile.
         """
+
         check_is_fitted(self)
         # Check data.
         X = self._validate_X_predict(X)
@@ -727,7 +732,7 @@ class BaseForestQuantileRegressor(ForestRegressor):
                 warnings.simplefilter("ignore", UserWarning)
                 X_leaves = self.apply(X)
             X_indices = None
-
+        
         if self.max_samples_leaf == 1:  # optimize for single-sample-per-leaf performance
             y_train_leaves = np.asarray(self.forest_.y_train_leaves)
             y_train = np.asarray(self.forest_.y_train).T
@@ -752,7 +757,7 @@ class BaseForestQuantileRegressor(ForestRegressor):
                     method = interpolation.decode()
                     y_pred[:, output, :] = func(leaf_values, quantiles, method=method, axis=1).T
 
-        elif (self.max_samples_leaf != None) and (aggregate_leaves_first):
+        elif (self.max_samples_leaf != None) and aggregate_leaves_first and not reduce_to_occurences:
             y_train_leaves = np.asarray(self.forest_.y_train_leaves)
             y_train = np.asarray(self.forest_.y_train).T
             n_leaf_sample = self.max_samples_leaf
@@ -799,6 +804,56 @@ class BaseForestQuantileRegressor(ForestRegressor):
                     func = np.quantile if X_indices is None else np.nanquantile
                     method = interpolation.decode()
                     y_pred[:, output, :] = func(leaf_values_aggregated, quantiles, method=method, axis=1).T
+        elif (self.max_samples_leaf != None) and aggregate_leaves_first and reduce_to_occurences:
+            y_train_leaves = np.asarray(self.forest_.y_train_leaves)
+            y_train = np.asarray(self.forest_.y_train).T
+            n_leaf_sample = self.max_samples_leaf
+
+            n_tsteps = len(X_leaves)
+            # Compute bins from y_train
+            bins = np.unique(y_train) # unique y values in trees
+            n_bins = len(bins)
+
+            # don't use more than 4 GB of memory
+            n_blocks_samples = int(np.ceil(n_leaf_sample * n_tsteps * 8 / 4E9))
+            idx_samples = np.array_split(np.arange(n_leaf_sample), n_blocks_samples)
+            if len(quantiles) > 1:
+                 y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
+            elif quantiles[0] == -1:
+                y_pred = np.empty((len(X), y_train.shape[1], 1))
+            for output in range(y_train.shape[1]):
+                leaf_hist = np.zeros((n_tsteps, n_bins))
+                for tree in range(self.n_estimators):
+                    for block in range(n_blocks_samples): # loop on samples by leaf
+                        if X_indices is None:  # IB scoring
+                            train_indices = y_train_leaves[:,:,:,idx_samples[block]][tree, X_leaves[:, tree], output]
+                        else:  # OOB scoring
+                            warn('This is not implemented!! ')
+                            # indices = X_indices[:, tree] == 1
+                            # leaves = X_leaves[indices, tree]
+                            # train_indices = np.zeros(len(X), dtype=int)
+                            # train_indices[indices] = y_train_leaves[tree, leaves, output, n_leaf_sample]
+                        y_extract = y_train[train_indices - 1, output]
+                        digits = np.digitize(y_extract,bins, right = True) # index of y_extract in bins
+                        digits[train_indices == 0] = -1 # so they are not used in loop below
+                        toadd = np.zeros((n_tsteps, n_bins))
+                        for i in range(n_bins): # loop on bins: this is the BOTTLENECK
+                            toadd[range(n_tsteps), i] = np.count_nonzero(digits == i, axis = 1)
+                        leaf_hist += toadd
+
+
+                if len(quantiles) == 1 and quantiles[0] == -2:
+                    n_train_samples = np.sum(leaf_hist, axis = 1)
+                    y_pred = np.empty((n_tsteps, y_train.shape[1], 2, n_bins))
+
+                    # Calculate the cumulative sum of the histogram counts
+                    events = np.cumsum(leaf_hist, axis = 1)
+                    # Normalize to get the cumulative probability (ECDF values)
+                    cdf = events / n_train_samples[:,None]
+
+                    bins_tiled = np.tile(bins,(n_tsteps, 1))
+                    y_pred[:, output, 0, :] = bins_tiled
+                    y_pred[:, output, 1, :] =  cdf
 
         else:
             warn("ECDF for max_samples_leaf = None and aggregate_leaves_first = False not implemented!")
