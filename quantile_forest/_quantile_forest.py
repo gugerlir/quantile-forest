@@ -59,7 +59,7 @@ from ._quantile_forest_fast import QuantileForest, generate_unsampled_indices
 
 sklearn_version = parse_version(sklearn.__version__)
 
-@jit(nopython=True)
+@jit(nopython=True, fastmath=True)
 def _count_digits_numba(digits, n_bins):
     n_tsteps = len(digits)
     n_samples_per_leaf = digits.shape[1]
@@ -67,9 +67,8 @@ def _count_digits_numba(digits, n_bins):
     for i in range(n_tsteps):  # Iterate over time steps
         for j in range(n_samples_per_leaf):
             digit = digits[i, j]
-            for k in range(n_bins):  # Iterate over the second dimension of 'digits'
-                if digit == k:  # Check if the digit is within the valid range of bins
-                    toadd[i, k] += 1  # Increment the count for the bin
+            if 0 <= digit < n_bins:  # Ensure the digit is within the valid range of bins
+                toadd[i, digit] += 1  # Increment the count for the corresponding bin
     return toadd
 
 def _generate_unsampled_indices(sample_indices, duplicates=None):
