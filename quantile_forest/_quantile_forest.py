@@ -67,7 +67,7 @@ def _count_digits_numba(digits, n_bins):
     for i in range(n_tsteps):  # Iterate over time steps
         for j in range(n_samples_per_leaf):
             digit = digits[i, j]
-            if 0 <= digit < n_bins:  # Ensure the digit is within the valid range of bins
+            if 0 <= digit <= n_bins:  # Ensure the digit is within the valid range of bins
                 toadd[i, digit] += 1  # Increment the count for the corresponding bin
     return toadd
 
