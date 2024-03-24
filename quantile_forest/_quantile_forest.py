@@ -720,6 +720,8 @@ class BaseForestQuantileRegressor(ForestRegressor):
             quantiles = [-1]
         elif quantiles == ["ecdf"]:
             quantiles = [-2]
+        elif ("mean" in quantiles) and ("ecdf" in quantiles):
+            quantiles = [-3]
         else:
             for q in quantiles:
                 if not isinstance(q, (float, int)) or (q < 0 or q > 1):
@@ -771,9 +773,11 @@ class BaseForestQuantileRegressor(ForestRegressor):
                     y_pred[:, output, :] = func(leaf_values, quantiles, method=method, axis=1).T
 
         elif (self.max_samples_leaf != None) and aggregate_leaves_first and not reduce_to_occurences:
+            # Uses the scipy.stats.ecdf function
             y_train_leaves = np.asarray(self.forest_.y_train_leaves)
             y_train = np.asarray(self.forest_.y_train).T
             n_leaf_sample = self.max_samples_leaf
+            
             if len(quantiles) > 1:
                  y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
             elif quantiles[0] == -1:
@@ -817,6 +821,7 @@ class BaseForestQuantileRegressor(ForestRegressor):
                     func = np.quantile if X_indices is None else np.nanquantile
                     method = interpolation.decode()
                     y_pred[:, output, :] = func(leaf_values_aggregated, quantiles, method=method, axis=1).T
+
         elif (self.max_samples_leaf != None) and aggregate_leaves_first and reduce_to_occurences:
             y_train_leaves = np.asarray(self.forest_.y_train_leaves)
             y_train = np.asarray(self.forest_.y_train).T
@@ -831,10 +836,12 @@ class BaseForestQuantileRegressor(ForestRegressor):
             n_blocks_samples_per_leaf = int(np.ceil(n_leaf_sample * n_tsteps * 8 / 4E9))
             idx_samples_per_leaf = np.array_split(np.arange(n_leaf_sample), 
                 n_blocks_samples_per_leaf)
-            if len(quantiles) > 1:
-                 y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
+
+            if (len(quantiles) > 1) and (quantiles[0] != -3):
+                y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
             elif quantiles[0] == -1:
                 y_pred = np.empty((len(X), y_train.shape[1], 1))
+
             for output in range(y_train.shape[1]):
                 leaf_hist = np.zeros((n_tsteps, n_bins))
                 for tree in range(self.n_estimators):
@@ -853,8 +860,7 @@ class BaseForestQuantileRegressor(ForestRegressor):
                         toadd = _count_digits_numba(digits, n_bins)
                         leaf_hist += toadd
 
-
-                if len(quantiles) == 1 and quantiles[0] == -2:
+                if len(quantiles) == 1 and quantiles[0] <= -2:
                     total_samples = np.sum(leaf_hist, axis = 1)
                     y_pred = np.empty((n_tsteps, y_train.shape[1], 2, n_bins))
 
@@ -865,7 +871,16 @@ class BaseForestQuantileRegressor(ForestRegressor):
 
                     bins_tiled = np.tile(bins,(n_tsteps, 1))
                     y_pred[:, output, 0, :] = bins_tiled
-                    y_pred[:, output, 1, :] =  cdf
+                    y_pred[:, output, 1, :] = cdf
+
+                    if quantiles[0] == -3 :
+                        # get also mean prediction
+                        y_pred_mean = np.empty(n_tsteps)
+                        y_pred_mean = np.sum(bins * leaf_hist, axis=1)/ total_samples
+
+                elif len(quantiles) == 1 and quantiles[0] == -1:
+                    y_pred_mean = np.empty(n_tsteps)
+                    y_pred_mean = np.sum(bins * leaf_hist, axis=1)/ np.sum(leaf_hist, axis = 1)
 
         else:
             warn("ECDF for max_samples_leaf = None and aggregate_leaves_first = False not implemented!")
@@ -876,7 +891,10 @@ class BaseForestQuantileRegressor(ForestRegressor):
         if y_pred.shape[1] == 1:
             y_pred = np.squeeze(y_pred, axis=1)
 
-        return y_pred
+        if quantiles[0] == -2:
+            return y_pred
+        elif quantiles[0] == -3:
+            return y_pred, y_pred_mean
 
 
 
