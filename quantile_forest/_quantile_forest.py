@@ -22,12 +22,18 @@ Single and multi-output problems are both handled.
 """
 
 import random
+import psutil
 import warnings
 from abc import abstractmethod
 from math import ceil
 from numbers import Integral, Real
 from warnings import warn
 
+from scipy import stats
+from scipy.sparse import csr_matrix
+from scipy.stats._survival import ECDFResult
+
+import sys
 import joblib
 import numpy as np
 import sklearn
@@ -40,6 +46,8 @@ from sklearn.tree import DecisionTreeRegressor, ExtraTreeRegressor
 from sklearn.tree._tree import DTYPE
 from sklearn.utils import parse_version
 
+from numba import jit
+
 param_validation = True
 try:
     from sklearn.utils._param_validation import Interval, RealNotInt
@@ -51,6 +59,17 @@ from ._quantile_forest_fast import QuantileForest, generate_unsampled_indices
 
 sklearn_version = parse_version(sklearn.__version__)
 
+@jit(nopython=True, fastmath=True)
+def _count_digits_numba(digits, n_bins):
+    n_tsteps = len(digits)
+    n_samples_per_leaf = digits.shape[1]
+    toadd = np.zeros((n_tsteps, n_bins), dtype=np.int64)
+    for i in range(n_tsteps):  # Iterate over time steps
+        for j in range(n_samples_per_leaf):
+            digit = digits[i, j]
+            if 0 <= digit <= n_bins:  # Ensure the digit is within the valid range of bins
+                toadd[i, digit] += 1  # Increment the count for the corresponding bin
+    return toadd
 
 def _generate_unsampled_indices(sample_indices, duplicates=None):
     """Private function used by forest._get_y_train_leaves function."""
@@ -602,6 +621,282 @@ class BaseForestQuantileRegressor(ForestRegressor):
             y_pred = np.squeeze(y_pred, axis=1)
 
         return y_pred
+
+
+    def predict_ecdf(
+        self,
+        X,
+        quantiles=None,
+        interpolation="linear",
+        weighted_quantile=True,
+        weighted_leaves=False,
+        aggregate_leaves_first=True,
+        reduce_to_occurences=True,
+        oob_score=False,
+        indices=None,
+        duplicates=None,
+    ):
+        """Predict quantiles for X.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The input samples. Internally, its dtype will be converted to
+            ``dtype=np.float32``. If a sparse matrix is provided, it will be
+            converted into a sparse ``csr_matrix``.
+
+        quantiles : float, list, or "mean", default=None
+            The quantile or list of quantiles that the model tries to predict.
+            Each quantile must be strictly between 0 and 1. If "mean", the
+            model predicts the mean. If None, the model uses the value of
+            `default_quantiles`.
+
+        interpolation : {"linear", "lower", "higher", "midpoint", "nearest"}, \
+                default="linear"
+            Specifies the interpolation method to use when the desired
+            quantile lies between two data points ``i < j``:
+
+            - If "linear", then ``i + (j - i) * fraction``, where ``fraction``
+              is the fractional part of the index surrounded by ``i`` and
+              ``j``.
+            - If "lower", then ``i``.
+            - If "higher", then ``j``.
+            - If "nearest", then ``i`` or ``j``, whichever is nearest.
+            - If "midpoint", then ``(i + j) / 2``.
+
+        weighted_quantile : bool, default=True
+            Calculate a weighted quantile. Weighted quantiles are computed by
+            assigning weights to each training sample, while unweighted
+            quantiles are computed by aggregating sibling samples. When the
+            number of training samples relative to siblings is small, weighted
+            quantiles can be more efficient to compute than unweighted ones.
+
+        weighted_leaves : bool, default=False
+            Weight samples inversely to the size of their leaf node.
+            Only used if `weighted_quantile=True` and `max_samples_leaf!=1`.
+
+        aggregate_leaves_first : bool, default=True
+            Calculate predictions using aggregated leaf values. If True, a
+            single prediction is calculated over the aggregated leaf values.
+            If False, a prediction is calculated for each leaf and aggregated.
+
+        oob_score : bool, default=False
+            Only use out-of-bag (OOB) samples to predict quantiles.
+
+        Other Parameters
+        ----------------
+        indices : list, default=None
+            List of training indices that correspond to X indices. An index of
+            -1 can be used to specify rows omitted from the training set. By
+            default, assumes all X indices correspond to all training indices.
+            Only used if `oob_score=True`.
+
+        duplicates : list of lists, default=None
+            List of sets of functionally identical indices.
+            Only used if `oob_score=True`.
+
+        Returns
+        -------
+        y_pred : array of shape (n_samples, n_outputs, n_quantiles)
+            If quantiles is set to 'mean', then return ``E(Y | X)``. Else, for
+            all quantiles, return ``y`` at ``q`` for which ``F(Y=y|x) = q``,
+            where ``q`` is the quantile.
+        """
+
+        check_is_fitted(self)
+        # Check data.
+        X = self._validate_X_predict(X)
+
+        if quantiles is None:
+            if self.default_quantiles is None:
+                quantiles = ["mean"]
+            else:
+                quantiles = self.default_quantiles
+
+        if not isinstance(quantiles, list):
+            quantiles = [quantiles]
+
+        if quantiles == ["mean"]:
+            quantiles = [-1]
+        elif quantiles == ["ecdf"]:
+            quantiles = [-2]
+        elif ("mean" in quantiles) and ("ecdf" in quantiles):
+            quantiles = [-3]
+        else:
+            for q in quantiles:
+                if not isinstance(q, (float, int)) or (q < 0 or q > 1):
+                    raise ValueError(f"Quantiles must be in the range [0, 1], got {q}.")
+
+        if not isinstance(interpolation, (bytes, bytearray)):
+            interpolation = interpolation.encode()
+
+        if oob_score:
+            if not self.bootstrap:
+                raise ValueError("Out-of-bag estimation only available if bootstrap=True.")
+
+            X_leaves, X_indices = self._oob_samples(X, indices, duplicates)
+
+            if (X_indices.sum(axis=1) == 0).any():
+                warn(
+                    "Some inputs do not have OOB scores. "
+                    "This probably means too few trees were used "
+                    "to compute any reliable OOB estimates."
+                )
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                X_leaves = self.apply(X)
+            X_indices = None
+        
+        if self.max_samples_leaf == 1:  # optimize for single-sample-per-leaf performance
+            y_train_leaves = np.asarray(self.forest_.y_train_leaves)
+            y_train = np.asarray(self.forest_.y_train).T
+            y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
+            for output in range(y_train.shape[1]):
+                leaf_values = np.empty((len(X), self.n_estimators))
+                for tree in range(self.n_estimators):
+                    if X_indices is None:  # IB scoring
+                        train_indices = y_train_leaves[tree, X_leaves[:, tree], output, 0]
+                    else:  # OOB scoring
+                        indices = X_indices[:, tree] == 1
+                        leaves = X_leaves[indices, tree]
+                        train_indices = np.zeros(len(X), dtype=int)
+                        train_indices[indices] = y_train_leaves[tree, leaves, output, 0]
+                    leaf_values[:, tree] = y_train[train_indices - 1, output]
+                    leaf_values[train_indices == 0, tree] = np.nan
+                if len(quantiles) == 1 and quantiles[0] == -1:  # calculate mean
+                    func = np.mean if X_indices is None else np.nanmean
+                    y_pred[:, output, :] = np.expand_dims(func(leaf_values, axis=1), axis=1)
+                else:  # calculate quantiles
+                    func = np.quantile if X_indices is None else np.nanquantile
+                    method = interpolation.decode()
+                    y_pred[:, output, :] = func(leaf_values, quantiles, method=method, axis=1).T
+
+        elif (self.max_samples_leaf != None) and aggregate_leaves_first and not reduce_to_occurences:
+            # Uses the scipy.stats.ecdf function
+            y_train_leaves = np.asarray(self.forest_.y_train_leaves)
+            y_train = np.asarray(self.forest_.y_train).T
+            n_leaf_sample = self.max_samples_leaf
+            
+            if len(quantiles) > 1:
+                 y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
+            elif quantiles[0] == -1:
+                y_pred = np.empty((len(X), y_train.shape[1], 1))
+                
+            for output in range(y_train.shape[1]):
+                leaf_values = np.empty((len(X), self.n_estimators, n_leaf_sample))
+                for tree in range(self.n_estimators):
+                    if X_indices is None:  # IB scoring
+                        train_indices = y_train_leaves[tree, X_leaves[:, tree], output]
+                        zerovalue = np.where(train_indices == 0)
+                    else:  # OOB scoring
+                        warn('This is not implemented!! ')
+                        # indices = X_indices[:, tree] == 1
+                        # leaves = X_leaves[indices, tree]
+                        # train_indices = np.zeros(len(X), dtype=int)
+                        # train_indices[indices] = y_train_leaves[tree, leaves, output, n_leaf_sample]
+                    leaf_values[:, tree, :] = y_train[train_indices - 1, output]
+                    leaf_values[zerovalue[0], tree, zerovalue[1]] = np.nan
+                # TODO: We need to collapse or bring together ntrees and n_samples leaf
+                # Reduce 3D array (leaf_values) to 2D array again
+                leaf_values_aggregated = np.empty((len(X), n_leaf_sample * self.n_estimators))
+                leaf_values_aggregated[:,:] = leaf_values.reshape(len(X),-1)
+                
+                if len(quantiles) == 1 and quantiles[0] == -2:
+                    n_train_samples_unique = len(np.unique(leaf_values_aggregated))
+                    y_pred = np.empty((len(X), y_train.shape[1], 2, n_train_samples_unique))
+                    for sample in range(len(X)):
+                        res = stats.ecdf(leaf_values_aggregated[sample])
+                        n_to_pad = n_train_samples_unique - len(res.cdf.quantiles)
+                        y_pred[sample, output, 0, :] = np.pad(res.cdf.quantiles, (0,n_to_pad), 
+                                                                mode='constant', constant_values=-9)
+                        y_pred[sample, output, 1, :] =  np.pad(res.cdf.probabilities, (0,n_to_pad), 
+                                                                mode='constant', constant_values=-9)
+
+                elif len(quantiles) == 1 and quantiles[0] == -1:  # calculate mean
+                    func = np.mean if X_indices is None else np.nanmean
+                    y_pred[:, output, :] = np.expand_dims(func(leaf_values_aggregated, axis=1), axis=1)
+
+                else:  # calculate quantiles
+                    func = np.quantile if X_indices is None else np.nanquantile
+                    method = interpolation.decode()
+                    y_pred[:, output, :] = func(leaf_values_aggregated, quantiles, method=method, axis=1).T
+
+        elif (self.max_samples_leaf != None) and aggregate_leaves_first and reduce_to_occurences:
+            y_train_leaves = np.asarray(self.forest_.y_train_leaves)
+            y_train = np.asarray(self.forest_.y_train).T
+            n_leaf_sample = self.max_samples_leaf
+
+            n_tsteps = len(X_leaves)
+            # Compute bins from y_train
+            bins = np.unique(y_train) # unique y values in trees
+            n_bins = len(bins)
+
+            # don't use more than 4 GB of memory
+            n_blocks_samples_per_leaf = int(np.ceil(n_leaf_sample * n_tsteps * 8 / 4E9))
+            idx_samples_per_leaf = np.array_split(np.arange(n_leaf_sample), 
+                n_blocks_samples_per_leaf)
+
+            if (len(quantiles) > 1) and (quantiles[0] != -3):
+                y_pred = np.empty((len(X), y_train.shape[1], len(quantiles)))
+            elif quantiles[0] == -1:
+                y_pred = np.empty((len(X), y_train.shape[1], 1))
+
+            for output in range(y_train.shape[1]):
+                leaf_hist = np.zeros((n_tsteps, n_bins))
+                for tree in range(self.n_estimators):
+                    for block in range(n_blocks_samples_per_leaf): # loop on samples by leaf
+                        if X_indices is None:  # IB scoring
+                            train_indices = y_train_leaves[:,:,:,idx_samples_per_leaf[block]][tree, X_leaves[:, tree], output]
+                        else:  # OOB scoring
+                            warn('This is not implemented!! ')
+                            # indices = X_indices[:, tree] == 1
+                            # leaves = X_leaves[indices, tree]
+                            # train_indices = np.zeros(len(X), dtype=int)
+                            # train_indices[indices] = y_train_leaves[tree, leaves, output, n_leaf_sample]
+                        y_extract = y_train[train_indices - 1, output]
+                        digits = np.digitize(y_extract,bins, right = True) # index of y_extract in bins
+                        digits[train_indices == 0] = -1 # so they are not used in loop below
+                        toadd = _count_digits_numba(digits, n_bins)
+                        leaf_hist += toadd
+
+                if len(quantiles) == 1 and quantiles[0] <= -2:
+                    total_samples = np.sum(leaf_hist, axis = 1)
+                    y_pred = np.empty((n_tsteps, y_train.shape[1], 2, n_bins))
+
+                    # Calculate the cumulative sum of the histogram counts
+                    events = np.cumsum(leaf_hist, axis = 1)
+                    # Normalize to get the cumulative probability (ECDF values)
+                    cdf = events / total_samples[:,None]
+
+                    bins_tiled = np.tile(bins,(n_tsteps, 1))
+                    y_pred[:, output, 0, :] = bins_tiled
+                    y_pred[:, output, 1, :] = cdf
+
+                    if quantiles[0] == -3 :
+                        # get also mean prediction
+                        y_pred_mean = np.empty(n_tsteps)
+                        y_pred_mean = np.sum(bins * leaf_hist, axis=1)/ total_samples
+
+                elif len(quantiles) == 1 and quantiles[0] == -1:
+                    y_pred_mean = np.empty(n_tsteps)
+                    y_pred_mean = np.sum(bins * leaf_hist, axis=1)/ np.sum(leaf_hist, axis = 1)
+
+        else:
+            warn("ECDF for max_samples_leaf = None and aggregate_leaves_first = False not implemented!")
+
+        if y_pred.shape[2] == 1:
+            y_pred = np.squeeze(y_pred, axis=2)
+
+        if y_pred.shape[1] == 1:
+            y_pred = np.squeeze(y_pred, axis=1)
+
+        if quantiles[0] == -2:
+            return y_pred
+        elif quantiles[0] == -3:
+            return y_pred, y_pred_mean
+
+
 
     def quantile_ranks(
         self,
