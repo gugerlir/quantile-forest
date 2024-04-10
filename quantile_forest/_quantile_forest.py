@@ -279,22 +279,27 @@ class BaseForestQuantileRegressor(ForestRegressor):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            X_leaves = self.apply(X)
+            X_leaves_all = self.apply(X)
 
-        shape = (n_samples, self.n_estimators)
+        if self.bootstrap:
+            n_samples_bootstrap = _get_n_samples_bootstrap(n_samples, self.max_samples)
+            shape = (n_samples_bootstrap, self.n_estimators)
+            X_leaves = np.empty(shape, dtype=np.int64)
+        else:
+            shape = (n_samples, self.n_estimators)            
+
         bootstrap_indices = np.empty(shape, dtype=np.int64)
         for i, estimator in enumerate(self.estimators_):
             # Get bootstrap indices.
             if self.bootstrap:
-                n_samples_bootstrap = _get_n_samples_bootstrap(n_samples, self.max_samples)
                 bootstrap_indices[:, i] = _generate_sample_indices(
                     estimator.random_state, n_samples, n_samples_bootstrap
                 )
+                # Get predictions on bootstrap indices.
+                X_leaves[:, i] = X_leaves_all[bootstrap_indices[:, i], i]
             else:
                 bootstrap_indices[:, i] = np.arange(n_samples)
-
-            # Get predictions on bootstrap indices.
-            X_leaves[:, i] = X_leaves[bootstrap_indices[:, i], i]
+                X_leaves = X_leaves_all
 
         if sorter is not None:
             # Reassign bootstrap indices to account for target sorting.
