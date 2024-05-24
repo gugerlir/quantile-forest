@@ -24,10 +24,15 @@ Single and multi-output problems are both handled.
 import random
 import psutil
 import warnings
+import logging
 from abc import abstractmethod
 from math import ceil
 from numbers import Integral, Real
 from warnings import warn
+
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('_quantile_forest')
 
 from scipy import stats
 from scipy.sparse import csr_matrix
@@ -144,7 +149,8 @@ class BaseForestQuantileRegressor(ForestRegressor):
 
         self.param_validation = hasattr(self, "_parameter_constraints")
 
-    def fit(self, X, y, sample_weight=None, sparse_pickle=False):
+    def fit(self, X, y, sample_weight=None, sparse_pickle=False,
+            return_samples_per_leaf=False):
         """Build a forest from the training set (X, y).
 
         Parameters
@@ -166,6 +172,10 @@ class BaseForestQuantileRegressor(ForestRegressor):
 
         sparse_pickle : bool, default=False
             Pickle the underlying data structure using a SciPy sparse matrix.
+
+        return_samples_per_leaf : bool, default =False
+            will safe a list with the number of samples stored in the leaves of the
+            trees 
 
         Returns
         -------
@@ -210,7 +220,8 @@ class BaseForestQuantileRegressor(ForestRegressor):
 
         # Get map of tree leaf nodes to training indices.
         y_train_leaves = self._get_y_train_leaves(
-            X, y_sorted.shape[-1], sorter=sorter, sample_weight=sample_weight
+            X, y_sorted.shape[-1], sorter=sorter, sample_weight=sample_weight,
+            return_samples_per_leaf=return_samples_per_leaf
         )
 
         # Create quantile forest object.
@@ -225,7 +236,8 @@ class BaseForestQuantileRegressor(ForestRegressor):
 
         return self
 
-    def _get_y_train_leaves(self, X, y_dim, sorter=None, sample_weight=None):
+    def _get_y_train_leaves(self, X, y_dim, sorter=None, sample_weight=None,
+                return_samples_per_leaf=False):
         """Return a mapping of each leaf node to its list of training indices.
 
         The ``apply`` function is used on the ``X`` values to obtain the leaf
@@ -249,6 +261,10 @@ class BaseForestQuantileRegressor(ForestRegressor):
             Sample weights. If None, then samples are equally weighted. Splits
             that would create child nodes with net zero or negative weight are
             ignored while searching for a split in each node.
+        
+        return_samples_per_leaf: bool, if True a list with all the number of 
+            samples per leaf per tree is returned. It is useful to inspect the 
+            tree.
 
         Returns
         -------
@@ -326,6 +342,8 @@ class BaseForestQuantileRegressor(ForestRegressor):
         shape = (self.n_estimators, max_node_count, y_dim, max_samples_leaf)
         y_train_leaves = np.zeros(shape, dtype=np.int64)
 
+        nsamplesleafspertree = []
+
         for i, estimator in enumerate(self.estimators_):
             # Group training indices by leaf node.
             leaf_indices, leaf_values_list = _group_by_value(X_leaves[:, i])
@@ -333,13 +351,21 @@ class BaseForestQuantileRegressor(ForestRegressor):
             if leaf_subsample:
                 random.seed(estimator.random_state)
 
+            # Initialize for each tree:
+            nsamplesperleaf = []
+
             # Map each leaf node to its list of training indices.
+            nleafs = 0
             for leaf_idx, leaf_values in zip(leaf_indices, leaf_values_list):
                 y_indices = bootstrap_indices[:, i][leaf_values]
 
                 if sample_weight is not None:
                     sample_weight = np.squeeze(sample_weight)
                     y_indices = y_indices[sample_weight[y_indices - 1] > 0]
+
+                # Print minimum/ median/ max number of samples within a leaf
+                nsamplesperleaf.append(len(y_indices))
+                nleafs += 1
 
                 # Subsample leaf training indices (without replacement).
                 if leaf_subsample and max_samples_leaf < len(y_indices):
@@ -355,6 +381,14 @@ class BaseForestQuantileRegressor(ForestRegressor):
                 else:
                     for j in range(y_dim):
                         y_train_leaves[i, leaf_idx, j, : len(y_indices)] = y_indices
+
+            # Print the number for each tree:
+            nsamplesleafspertree.append(nsamplesperleaf)
+            nsamplesperleaf = np.sort(np.array(nsamplesperleaf))
+            logger.info(f'Estimator {i}, nleafs={nleafs}, n_samples: min={nsamplesperleaf[0]}; max={nsamplesperleaf[-1]}')
+
+        if return_samples_per_leaf:
+            self.samples_per_leaf_per_tree = nsamplesleafspertree
 
         return y_train_leaves
 
